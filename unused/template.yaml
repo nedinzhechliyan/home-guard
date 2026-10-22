@@ -1,0 +1,315 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Home Guard - Alexa+ MCP Command-Contract Reliability Layer on AWS Serverless.
+  Streamable HTTP (stateless, spec 2025-11-25) with DynamoDB, EventBridge Scheduler & Cognito.
+
+Parameters:
+  DeviceProvider:
+    Type: String
+    Default: 'lifx'
+    AllowedValues:
+      - 'lifx'
+      - 'homeassistant'
+    Description: Smart home device backend provider.
+
+  LifxToken:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: LIFX Personal Access Token (from cloud.lifx.com).
+
+  HaUrl:
+    Type: String
+    Default: ''
+    Description: Home Assistant instance base URL (e.g. https://ha.yourdomain.com).
+
+  HaToken:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Home Assistant Long-Lived Access Token.
+
+  DevStaticToken:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: >
+      Optional static bearer token for local development & console testing.
+      WARNING: Leave empty in production deployments.
+
+  ConsoleOrigin:
+    Type: String
+    Default: '*'
+    Description: Allowed CORS origin for the Home Guard Web Console.
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 512
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+  # =========================================================================
+  # HTTP API (API Gateway v2)
+  # =========================================================================
+  HomeGuardHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref ConsoleOrigin
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - Accept
+          - Mcp-Session-Id
+        AllowMethods:
+          - POST
+          - GET
+          - OPTIONS
+          - DELETE
+        ExposeHeaders:
+          - Mcp-Session-Id
+        MaxAge: 600
+
+  # =========================================================================
+  # DynamoDB Tables (On-Demand Pay-per-request)
+  # =========================================================================
+  HomeGuardLedgerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'HomeGuardLedger-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: command_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: command_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  HomeGuardSchedulesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'HomeGuardSchedules-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: plan_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: plan_id
+          KeyType: HASH
+
+  # =========================================================================
+  # Cognito User Pool, Client, Domain & Resource Server
+  # =========================================================================
+  HomeGuardUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'home-guard-users-${AWS::StackName}'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+
+  HomeGuardResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      Identifier: !Sub 'https://homeguard.${AWS::Region}.api.aws'
+      Name: 'Home Guard MCP API'
+      UserPoolId: !Ref HomeGuardUserPool
+      Scopes:
+        - ScopeName: 'commands'
+          ScopeDescription: 'Execute household device state commands'
+
+  HomeGuardUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: HomeGuardResourceServer
+    Properties:
+      ClientName: !Sub 'home-guard-client-${AWS::StackName}'
+      UserPoolId: !Ref HomeGuardUserPool
+      GenerateSecret: false
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+        - !Sub 'https://homeguard.${AWS::Region}.api.aws/commands'
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - 'http://localhost:3000'
+        - 'https://oauth.pstmn.io/v1/callback'
+      SupportedIdentityProviders:
+        - COGNITO
+
+  HomeGuardUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'homeguard-auth-${AWS::AccountId}'
+      UserPoolId: !Ref HomeGuardUserPool
+
+  # =========================================================================
+  # EventBridge Scheduler Execution Role
+  # =========================================================================
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'HomeGuardSchedulerRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeExecutorLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt HomeGuardExecutorFunction.Arn
+
+  # =========================================================================
+  # Lambda Functions
+  # =========================================================================
+  HomeGuardMcpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HomeGuardMcp-${AWS::StackName}'
+      CodeUri: ./backend
+      Handler: lambda_function.lambda_handler
+      Environment:
+        Variables:
+          DEVICE_PROVIDER: !Ref DeviceProvider
+          LIFX_TOKEN: !Ref LifxToken
+          HA_URL: !Ref HaUrl
+          HA_TOKEN: !Ref HaToken
+          DEV_STATIC_TOKEN: !Ref DevStaticToken
+          LEDGER_TABLE_NAME: !Ref HomeGuardLedgerTable
+          SCHEDULES_TABLE_NAME: !Ref HomeGuardSchedulesTable
+          COGNITO_USER_POOL_ID: !Ref HomeGuardUserPool
+          COGNITO_CLIENT_ID: !Ref HomeGuardUserPoolClient
+          COGNITO_DOMAIN: !Sub 'homeguard-auth-${AWS::AccountId}'
+          EXECUTOR_LAMBDA_ARN: !GetAtt HomeGuardExecutorFunction.Arn
+          SCHEDULER_ROLE_ARN: !GetAtt EventBridgeSchedulerRole.Arn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HomeGuardLedgerTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HomeGuardSchedulesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:GetSchedule
+                - scheduler:DeleteSchedule
+              Resource: !Sub 'arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/*'
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource: !GetAtt EventBridgeSchedulerRole.Arn
+      Events:
+        McpPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HomeGuardHttpApi
+            Path: /mcp
+            Method: POST
+        McpGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HomeGuardHttpApi
+            Path: /mcp
+            Method: GET
+        McpDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HomeGuardHttpApi
+            Path: /mcp
+            Method: DELETE
+        OAuthMetadata:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HomeGuardHttpApi
+            Path: /.well-known/oauth-authorization-server
+            Method: GET
+
+  HomeGuardExecutorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'HomeGuardExecutor-${AWS::StackName}'
+      CodeUri: ./backend
+      Handler: executor_lambda.lambda_handler
+      Environment:
+        Variables:
+          DEVICE_PROVIDER: !Ref DeviceProvider
+          LIFX_TOKEN: !Ref LifxToken
+          HA_URL: !Ref HaUrl
+          HA_TOKEN: !Ref HaToken
+          LEDGER_TABLE_NAME: !Ref HomeGuardLedgerTable
+          SCHEDULES_TABLE_NAME: !Ref HomeGuardSchedulesTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HomeGuardLedgerTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HomeGuardSchedulesTable
+
+  # CloudWatch Log Groups for audit compliance
+  HomeGuardMcpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${HomeGuardMcpFunction}'
+      RetentionInDays: 30
+
+  HomeGuardExecutorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${HomeGuardExecutorFunction}'
+      RetentionInDays: 30
+
+Outputs:
+  McpUrl:
+    Description: 'MCP Streamable HTTP Endpoint for Home Guard'
+    Value: !Sub 'https://${HomeGuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com/mcp'
+    Export:
+      Name: !Sub '${AWS::StackName}-McpUrl'
+
+  OAuthMetadataUrl:
+    Description: 'RFC 8414 Authorization Server Metadata URL'
+    Value: !Sub 'https://${HomeGuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com/.well-known/oauth-authorization-server'
+
+  CognitoUserPoolId:
+    Description: 'Cognito User Pool ID'
+    Value: !Ref HomeGuardUserPool
+
+  CognitoClientId:
+    Description: 'Cognito App Client ID'
+    Value: !Ref HomeGuardUserPoolClient
+
+  CognitoAuthDomain:
+    Description: 'Cognito Hosted UI Domain'
+    Value: !Sub 'https://${HomeGuardUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+
+  LedgerTableName:
+    Description: 'DynamoDB Command Ledger Table'
+    Value: !Ref HomeGuardLedgerTable
+
+  SchedulesTableName:
+    Description: 'DynamoDB Scheduled Plans Table'
+    Value: !Ref HomeGuardSchedulesTable

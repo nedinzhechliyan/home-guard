@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Home Guard - command-contract MCP server (Streamable HTTP) on Lambda Function URL
+
+Parameters:
+  McpToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Bearer token clients must send (generate a long random string)
+  CorsOrigin:
+    Type: String
+    Default: "*"
+    Description: Allowed browser origin for the console (use your console URL in production)
+  DeviceProvider:
+    Type: String
+    Default: virtual
+    AllowedValues: [virtual, lifx]
+  LifxToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+  DemoMode:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enables demo_set_online / demo_reset tools (virtual provider only)
+  DefaultTimezone:
+    Type: String
+    Default: UTC
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 10
+    MemorySize: 512
+
+Resources:
+  DevicesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: device_id, AttributeType: S}]
+      KeySchema: [{AttributeName: device_id, KeyType: HASH}]
+
+  LedgerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: command_id, AttributeType: S}]
+      KeySchema: [{AttributeName: command_id, KeyType: HASH}]
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+
+  SchedulesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: plan_id, AttributeType: S}]
+      KeySchema: [{AttributeName: plan_id, KeyType: HASH}]
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-mcp-function
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-mcp
+
+  McpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-mcp
+      CodeUri: src/
+      Handler: app.lambda_handler
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: [!Ref CorsOrigin]
+          AllowHeaders: [content-type, authorization, accept, mcp-session-id]
+          AllowMethods: ["*"]
+      Environment:
+        Variables:
+          MCP_TOKEN: !Ref McpToken
+          DEVICE_PROVIDER: !Ref DeviceProvider
+          LIFX_TOKEN: !Ref LifxToken
+          DEMO_MODE: !Ref DemoMode
+          DEFAULT_TZ: !Ref DefaultTimezone
+          DEVICES_TABLE: !Ref DevicesTable
+          LEDGER_TABLE: !Ref LedgerTable
+          SCHEDULES_TABLE: !Ref SchedulesTable
+          FUNCTION_ARN: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-mcp
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref DevicesTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref LedgerTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref SchedulesTable}
+        - Statement:
+            - Effect: Allow
+              Action: [scheduler:CreateSchedule, scheduler:DeleteSchedule, scheduler:GetSchedule]
+              Resource: "*"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerRole.Arn
+
+Outputs:
+  McpUrl:
+    Description: Paste into the console / Alexa AI CLI (send header Authorization Bearer <McpToken>)
+    Value: !Sub "${McpFunctionUrl.FunctionUrl}mcp"

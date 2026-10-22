@@ -1,0 +1,6 @@
+{
+  "name": "Home Guard Console",
+  "description": "Alexa+ MCP Command-Contract Reliability Layer on AWS Serverless with real-time verification and zero phantom routines.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
