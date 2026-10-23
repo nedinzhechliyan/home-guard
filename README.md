@@ -32,50 +32,29 @@ Home Guard solves this by establishing a strict **Command Contract**:
 
 ```mermaid
 flowchart TD
-    subgraph Client["Alexa+ & Web Console"]
-        Console["Home Guard Web Console\n(React + TypeScript)"]
-        AlexaClient["Alexa+ Voice Assistant\n(MCP Client)"]
+    subgraph Client["Client (simulated Alexa+ side)"]
+        Console["Home Guard Web Console<br/>React + TypeScript"]
     end
 
-    subgraph AWS["AWS Serverless Stack (Home Guard)"]
-        APIGW["Amazon API Gateway HTTP API v2\n(POST /mcp | GET /.well-known)"]
-        Cognito["Amazon Cognito User Pool\n(JWT Authentication & JWKS)"]
-        
-        subgraph Lambdas["Lambda Compute (Python 3.12 ARM64)"]
-            McpLambda["HomeGuardMcpFunction\n(MCP Streamable HTTP Router)"]
-            ExecLambda["HomeGuardExecutorFunction\n(Scheduled Action Execution)"]
-        end
-
-        subgraph Storage["Persistence & Scheduling"]
-            DDBLedger[("DynamoDB Ledger\nPK: command_id (TTL: 7d)")]
-            DDBSchedules[("DynamoDB Schedules\nPK: plan_id")]
-            Scheduler["Amazon EventBridge Scheduler\n(One-time at() / cron)"]
-        end
+    subgraph AWS["AWS ap-southeast-2"]
+        URL["Lambda Function URL<br/>HTTPS + bearer token"]
+        Fn["McpFunction<br/>Python 3.12, MCP Streamable HTTP"]
+        Devices[("DevicesTable<br/>virtual device state")]
+        Ledger[("LedgerTable<br/>command ledger with TTL")]
+        Plans[("SchedulesTable<br/>schedule plans")]
+        Sched["EventBridge Scheduler"]
+        Logs["CloudWatch Logs"]
     end
 
-    subgraph IoT["Real Smart Home Hardware"]
-        LIFX["LIFX Cloud HTTP API\n(Real Lights & Power States)"]
-        HomeAssistant["Home Assistant REST API\n(Real Local Entities)"]
-    end
-
-    Console -->|JSON-RPC 2.0 / Streamable HTTP| APIGW
-    AlexaClient -->|MCP Spec 2025-11-25| APIGW
-    APIGW -->|Cognito JWT / DEV_STATIC_TOKEN| McpLambda
-    Cognito -.->|JWKS Key Verification| McpLambda
-    
-    McpLambda -->|Conditional Write / Idempotency| DDBLedger
-    McpLambda -->|Store Plan| DDBSchedules
-    McpLambda -->|Create Schedule at()| Scheduler
-    Scheduler -->|Invoke Target| ExecLambda
-    ExecLambda -->|Update Verified State| DDBLedger
-
-    McpLambda -->|Parallel Dispatch & Readback| LIFX
-    McpLambda -->|Parallel Dispatch & Readback| HomeAssistant
-    ExecLambda -->|Execute Target Action| LIFX
-    ExecLambda -->|Execute Target Action| HomeAssistant
+    Console -->|"JSON-RPC over HTTPS"| URL
+    URL --> Fn
+    Fn -->|"read and write state"| Devices
+    Fn -->|"record and dedupe"| Ledger
+    Fn -->|"store plans"| Plans
+    Fn -->|"create schedule"| Sched
+    Sched -->|"invoke at run time"| Fn
+    Fn --> Logs
 ```
-
----
 
 ## MCP Tools Implemented (Spec 2025-11-25)
 
